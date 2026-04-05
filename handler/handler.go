@@ -2,23 +2,27 @@
 package handler
 
 import (
-	"context"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"net/http"
 	"time"
 
+	"github.com/risbern21/api_gateway/internal/database"
 	"github.com/risbern21/api_gateway/internal/token"
+	"github.com/risbern21/api_gateway/internal/validate"
 	"github.com/risbern21/api_gateway/model"
 	"github.com/risbern21/api_gateway/util"
+	"gorm.io/gorm"
 )
 
 type Handler struct {
+	db         *gorm.DB
 	tokenMaker *token.JWTMaker
 }
 
 func NewHandler(secretKey string) *Handler {
 	return &Handler{
+		db:         database.Client(),
 		tokenMaker: token.NewJWTMaker(secretKey),
 	}
 }
@@ -28,66 +32,89 @@ func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) CreateUser(w http.ResponseWriter, r *http.Request) {
-	u := model.NewUser()
-
+	u := &SigninRequest{}
 	if err := json.NewDecoder(r.Body).Decode(&u); err != nil {
-		http.Error(w, fmt.Sprintf("error creating user %v", err), http.StatusBadRequest)
+		http.Error(w, "error creating user", http.StatusBadRequest)
+		return
+	}
+
+	validator := validate.New()
+	if err := validator.Validator.Struct(u); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
 
 	password, err := util.HashPassword(u.Password)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("error creating user %v", err), http.StatusInternalServerError)
+		http.Error(w, "error creating user", http.StatusInternalServerError)
 		return
 	}
 
-	u.Password = password
+	m := model.NewUser()
+	m.Username = u.Username
+	m.Email = u.Email
+	m.Password = password
+	m.Role = model.Role(u.Role)
+	m.Phone = u.Phone
+	m.Address = u.Address
 
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	if err := u.AddUser(ctx); err != nil {
-		http.Error(w, fmt.Sprintf("error creating user %v", err), http.StatusInternalServerError)
+	if err := m.AddUser(h.db); err != nil {
+		http.Error(w, "error creating user", http.StatusInternalServerError)
 		return
 	}
+
+	res := &SigninResponse{}
+	res.ID = m.ID
+	res.Username = u.Username
+	res.Email = m.Email
+	res.Address = m.Address
+	res.Role = string(m.Role)
+	res.Phone = m.Phone
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(&u)
+	json.NewEncoder(w).Encode(&res)
 }
 
 func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 	req := &LoginReq{}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, fmt.Sprintf("error decoding user %v", err), http.StatusBadRequest)
+		http.Error(w, "error invalid request body", http.StatusBadRequest)
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
+	if err := validate.New().Validator.Struct(req); err != nil {
+		http.Error(w, "error invalid request body", http.StatusBadRequest)
+		return
+	}
 
 	u := model.NewUser()
-	err := u.GetUserByEmail(ctx, req.Email)
+	err := u.GetUserByEmail(h.db, req.Email)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("error while fetching user from db %v", err), http.StatusInternalServerError)
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			http.Error(w, "error user not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, "error unable to login", http.StatusInternalServerError)
 		return
 	}
 
 	if err := util.CheckPassword(req.Password, u.Password); err != nil {
-		http.Error(w, "invalid password", http.StatusBadRequest)
+		http.Error(w, "error invalid password", http.StatusBadRequest)
 		return
 	}
 
 	//generate JWT token and return
 	accessToken, accessTokenClaims, err := h.tokenMaker.CreateToken(u.ID, u.Email, u.Role.String(), 15*time.Minute)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("error while creating token : %v", err), http.StatusInternalServerError)
+		http.Error(w, "error creating token", http.StatusInternalServerError)
 		return
 	}
 
 	refreshToken, refreshTokenClaims, err := h.tokenMaker.CreateToken(u.ID, u.Email, u.Role.String(), 24*time.Hour)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("error while creating token : %v", err), http.StatusInternalServerError)
+		http.Error(w, "error creating token", http.StatusInternalServerError)
 		return
 	}
 
@@ -97,8 +124,9 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 	s.RefreshToken = refreshToken
 	s.IsRevoked = false
 	s.ExpiresAt = refreshTokenClaims.ExpiresAt.Time
-	if err := s.CreateSession(); err != nil {
-		http.Error(w, fmt.Sprintf("unable to create session : %v", err), http.StatusInternalServerError)
+
+	if err := s.CreateSession(h.db); err != nil {
+		http.Error(w, "error unable to create session", http.StatusInternalServerError)
 		return
 	}
 
@@ -120,14 +148,24 @@ func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
 	id := query["id"][0]
 	if id == "" {
-		http.Error(w, "invalid session id", http.StatusBadRequest)
+		http.Error(w, "error no session id", http.StatusBadRequest)
 		return
 	}
 
 	s := model.NewSession()
 	s.ID = id
-	if err := s.DeleteSession(); err != nil {
-		http.Error(w, fmt.Sprintf("unable to create session : %v", err), http.StatusInternalServerError)
+
+	if err := s.GetSession(h.db); err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			http.Error(w, "error session not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, "unable to get session", http.StatusInternalServerError)
+		return
+	}
+
+	if err := s.DeleteSession(h.db); err != nil {
+		http.Error(w, "unable to delete session", http.StatusInternalServerError)
 		return
 	}
 
@@ -137,20 +175,29 @@ func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) RenewAccessToken(w http.ResponseWriter, r *http.Request) {
 	req := &RenewAccessTokenReq{}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "unable to decode req body", http.StatusBadRequest)
+		http.Error(w, "error invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if err := validate.New().Validator.Struct(req); err != nil {
+		http.Error(w, "error invalid request body", http.StatusBadRequest)
 		return
 	}
 
 	refreshTokenClaims, err := h.tokenMaker.VerifyToken(req.RefreshToken)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("error while verifying token : %v", err), http.StatusUnauthorized)
+		http.Error(w, "error unable to verifying token", http.StatusUnauthorized)
 		return
 	}
 
 	s := model.NewSession()
 	s.ID = refreshTokenClaims.RegisteredClaims.ID
-	if err := s.GetSession(); err != nil {
-		http.Error(w, fmt.Sprintf("error while fetching session : %v", err), http.StatusInternalServerError)
+	if err := s.GetSession(h.db); err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			http.Error(w, "error session not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, "error unable to fetch session", http.StatusInternalServerError)
 		return
 	}
 
@@ -184,13 +231,22 @@ func (h *Handler) RevokeSession(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
 	id := query["id"][0]
 	if id == "" {
-		http.Error(w, "invalid session id", http.StatusBadRequest)
+		http.Error(w, "error no session id", http.StatusBadRequest)
 		return
 	}
 
 	s := model.NewSession()
 	s.ID = id
-	if err := s.RevokeSession(); err != nil {
+	if err := s.GetSession(h.db); err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			http.Error(w, "error unable to find session", http.StatusNotFound)
+			return
+		}
+		http.Error(w, "error unable to revoke session", http.StatusInternalServerError)
+		return
+	}
+
+	if err := s.RevokeSession(h.db); err != nil {
 		http.Error(w, "unable to revoke session", http.StatusInternalServerError)
 		return
 	}

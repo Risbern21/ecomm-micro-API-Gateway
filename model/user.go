@@ -1,11 +1,10 @@
 package model
 
 import (
-	"context"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/risbern21/api_gateway/internal/database"
+	"gorm.io/gorm"
 )
 
 type Role string
@@ -36,10 +35,10 @@ func NewUser() *User {
 	return &User{}
 }
 
-func (u *User) AddUser(ctx context.Context) error {
-	return database.Client().Save(&u).Error
+func (u *User) AddUser(db *gorm.DB) error {
+	return db.Save(&u).Error
 }
 
-func (u *User) GetUserByEmail(ctx context.Context, email string) error {
-	return database.Client().Table("users").Where("email= ?", email).First(&u).Error
+func (u *User) GetUserByEmail(db *gorm.DB, email string) error {
+	return db.Table("users").Where("email= ?", email).First(&u).Error
 }

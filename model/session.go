@@ -3,7 +3,7 @@ package model
 import (
 	"time"
 
-	"github.com/risbern21/api_gateway/internal/database"
+	"gorm.io/gorm"
 )
 
 type Session struct {
@@ -21,18 +21,18 @@ func NewSession() *Session {
 	return &Session{}
 }
 
-func (s *Session) CreateSession() error {
-	return database.Client().Save(&s).Error
+func (s *Session) CreateSession(db *gorm.DB) error {
+	return db.Create(&s).Error
 }
 
-func (s *Session) GetSession() error {
-	return database.Client().First(&s, "id = ?", s.ID).Error
+func (s *Session) GetSession(db *gorm.DB) error {
+	return db.First(&s, "id = ?", s.ID).Error
 }
 
-func (s *Session) RevokeSession() error {
-	return database.Client().Table("sessions").Where("id = ?", s.ID).Update("is_revoked", true).Error
+func (s *Session) RevokeSession(db *gorm.DB) error {
+	return db.Table("sessions").Where("id = ?", s.ID).Update("is_revoked", true).Error
 }
 
-func (s *Session) DeleteSession() error {
-	return database.Client().Delete(&s).Error
+func (s *Session) DeleteSession(db *gorm.DB) error {
+	return db.Delete(&s).Error
 }
