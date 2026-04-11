@@ -46,7 +46,7 @@ func getIP(r *http.Request) (string, error) {
 	splitIPs := strings.Split(ips, ",")
 
 	if len(splitIPs) > 0 {
-		netIP := net.ParseIP(splitIPs[len(splitIPs)-1])
+		netIP := net.ParseIP(strings.TrimSpace(splitIPs[len(splitIPs)-1]))
 		if netIP != nil {
 			return netIP.String(), nil
 		}
